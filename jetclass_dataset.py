@@ -27,7 +27,7 @@ class JetClassDataset(Dataset):
     def __len__(self):
         return len(self.files) * 100000  # Assuming each file has 100,000 events
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx):  #Generalize data loading 
         file_idx = idx // 100000
         event_idx = idx % 100000
         
@@ -52,7 +52,8 @@ class JetClassDataset(Dataset):
     
     def preprocess_jet(self, x):
         return (x - self.mean_jet) / self.std_jet
-
+# use num_workers to load data with multiple processes. Rule of thumb = num_workers = 4 * num_GPUs
+# Each process (GPU) will create its own DataLoader with num_workers workers.
 def get_dataloader(path, batch_size, rank, world_size, shuffle=True, num_workers=4):
     dataset = JetClassDataset(path, rank, world_size)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)

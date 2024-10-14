@@ -66,7 +66,7 @@ class PET(nn.Module):
         self.classifier_head = self.ClassifierHead(
             projection_dim, num_jet, num_classes, num_class_layers, simple,
             num_heads, dropout, talking_head, layer_scale, layer_scale_init, drop_probability,
-            self.TransformerBlock
+            self.ClassifierTransformerBlock
         )
         self.generator_head = self.GeneratorHead(
             projection_dim, num_jet, num_classes, num_feat, num_gen_layers, simple,
@@ -84,20 +84,20 @@ class PET(nn.Module):
         time = x.get('input_time', 0.1*torch.ones(features.shape[0], 1, device=self.device))
         
         label = x.get('input_label', None)
-        print(f"In PET forward, label: {label}")
+        #print(f"In PET forward, label: {label}")
     
         features = self.random_drop(features)
         features = self.feature_embedding(features)
     
         time_emb = self.time_embedding(time)
-        print(f"time_emb shape after time_embedding: {time_emb.shape}")
+        #print(f"time_emb shape after time_embedding: {time_emb.shape}")
     
         # Correct reshaping of time_emb
         time_emb = time_emb.squeeze(1).unsqueeze(1).repeat(1, features.shape[1], 1)
-        print(f"time_emb shape after reshape and repeat: {time_emb.shape}")
+        #print(f"time_emb shape after reshape and repeat: {time_emb.shape}")
     
         time_emb = time_emb * mask.unsqueeze(-1)
-        print(f"time_emb shape after applying mask: {time_emb.shape}")
+        #print(f"time_emb shape after applying mask: {time_emb.shape}")
     
         time_emb = self.time_embed_linear(time_emb)
         scale, shift = torch.chunk(time_emb, 2, dim=-1)
@@ -111,19 +111,19 @@ class PET(nn.Module):
         for transformer_block in self.transformer_blocks:
             features = transformer_block(features, mask)
         
-        features = features + skip_connection
+        features = features + skip_connection  #END OF PET BODY
         
         if mode in ['classifier', 'all']:
-            print(f"Before classifier_head, shapes: features: {features.shape}, jet: {jet.shape}, mask: {mask.shape}")
+            #print(f"Before classifier_head, shapes: features: {features.shape}, jet: {jet.shape}, mask: {mask.shape}")
             classifier_output = self.classifier_head(features, jet, mask)
         
         if mode in ['generator', 'all']:
-            print(f"Before generator_head, shapes: features: {features.shape}, jet: {jet.shape}, mask: {mask.shape}, time: {time.shape}, label: {label.shape if label is not None else None}")
-            print(f"Before generator_head, label dtype: {label.dtype if label is not None else None}")
+            #print(f"Before generator_head, shapes: features: {features.shape}, jet: {jet.shape}, mask: {mask.shape}, time: {time.shape}, label: {label.shape if label is not None else None}")
+            #print(f"Before generator_head, label dtype: {label.dtype if label is not None else None}")
             generator_output = self.generator_head(features, jet, mask, time, label)
             
-        print(f"Classifier output shapes: {classifier_output[0].shape}, {classifier_output[1].shape}")
-        print(f"Generator output shape: {generator_output.shape}")
+        #print(f"Classifier output shapes: {classifier_output[0].shape}, {classifier_output[1].shape}")
+        #print(f"Generator output shape: {generator_output.shape}")
         
         if mode == 'classifier':
             return classifier_output
@@ -191,7 +191,7 @@ class PET(nn.Module):
                     self.layer_scale2 = LayerScale(layer_scale_init, projection_dim)
 
             def forward(self, x, mask=None):
-                print(f"TransformerBlock input shapes: x: {x.shape}, mask: {mask.shape if mask is not None else None}")
+               # print(f"TransformerBlock input shapes: x: {x.shape}, mask: {mask.shape if mask is not None else None}")
                 if talking_head:
                     attn_output, _ = self.attn(self.norm1(x), int_matrix=None, mask=mask)
                 else:
@@ -203,23 +203,84 @@ class PET(nn.Module):
                 else:
                     x = x + self.drop_path(attn_output)
                     x = x + self.drop_path(self.mlp(self.norm2(x)))
-                
+                    
+                if mask is not None:
+                    x = x * mask.unsqueeze(-1)
+             
                 return x
 
         return TransformerBlockModule()
+    
+# CLASSIFIER HEAD START  --------------------------------------------------------------------------------------------------------------------------------- 
+
+    def ClassifierTransformerBlock(self, projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init, drop_probability):
+        class ClassifierTransformerBlockModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm1 = nn.LayerNorm(projection_dim)
+                self.norm2 = nn.LayerNorm(projection_dim)
+                self.norm3 = nn.LayerNorm(projection_dim)
+                
+                
+               
+                self.attn = nn.MultiheadAttention(projection_dim, num_heads, dropout, batch_first=True)
+                
+                self.mlp = nn.Sequential(
+                    nn.Linear(projection_dim, 2 * projection_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(2 * projection_dim, projection_dim),
+                )
+                
+                if layer_scale:
+                    self.layer_scale1 = LayerScale(layer_scale_init, projection_dim)
+                    self.layer_scale2 = LayerScale(layer_scale_init, projection_dim)
+
+            def forward(self, x, class_token, mask=None):
+               # print(f"TransformerBlock input shapes: x: {x.shape}, mask: {mask.shape if mask is not None else None}")
+                
+                x1 = self.norm1(x)
+                query = x1[:, 0].unsqueeze(1)  # Only use the class token as query
+    
+                updates, _ = self.attn(query, x1, x1, key_padding_mask=~mask.bool() if mask is not None else None) 
+                updates = self.norm2(updates)
+            
+                if layer_scale:
+                    updates = self.layer_scale1(updates, mask[:,:1]) # Apply layer scale only to class token
+                x2 = updates + class_token
+                
+                x3 = self.norm3(x2)
+                x3 = self.mlp(x3)
+                
+                if layer_scale:
+                    x3 = self.layer_scale2(x3, mask[:,:1]) # Apply layer scale only to class token
+                else:
+                    x3 = x3
+                cls_token = x3 + x2
+             
+                return x, cls_token
+
+        return ClassifierTransformerBlockModule()
 
     def ClassifierHead(self, projection_dim, num_jet, num_classes, num_layers, simple,
                        num_heads, dropout, talking_head, layer_scale, layer_scale_init,
-                       drop_probability, TransformerBlock):
+                       drop_probability, ClassifierTransformerBlock):
         class ClassifierHeadModule(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.jet_embedding = nn.Sequential(
-                    nn.Linear(num_jet, projection_dim),
-                    nn.GELU(),
-                    nn.Linear(projection_dim, 2 * projection_dim),
-                    nn.GELU()
-                )
+                
+                if simple:
+                    self.jet_embedding = nn.Sequential(
+                        nn.Linear(num_jet, 2 * projection_dim),
+                        nn.GELU(),
+                        nn.Linear(2 * projection_dim, projection_dim),
+                        nn.GELU()
+                            )
+                else:
+                    self.jet_embedding = nn.Sequential(
+                        nn.Linear(num_jet, 2 * projection_dim),
+                        nn.GELU()
+                            )
                 
                 if simple:
                     self.classifier = nn.Sequential(
@@ -229,8 +290,8 @@ class PET(nn.Module):
                     self.regressor = nn.Linear(projection_dim, num_jet)
                 else:
                     self.class_token = nn.Parameter(torch.zeros(1, 1, projection_dim))
-                    self.transformer_blocks = nn.ModuleList([
-                        TransformerBlock(projection_dim, num_heads, dropout, talking_head,
+                    self.clf_transformer_blocks = nn.ModuleList([
+                        ClassifierTransformerBlock(projection_dim, num_heads, dropout, talking_head,
                                          layer_scale, layer_scale_init, drop_probability)
                         for _ in range(num_layers)
                     ])
@@ -238,9 +299,9 @@ class PET(nn.Module):
                     self.regressor = nn.Linear(projection_dim, num_jet)
 
             def forward(self, x, jet, mask):
-                print(f"ClassifierHead input shapes: x: {x.shape}, jet: {jet.shape}, mask: {mask.shape}")
-                jet_emb = self.jet_embedding(jet)  #Jet embedding for both 
+                #print(f"ClassifierHead input shapes: x: {x.shape}, jet: {jet.shape}, mask: {mask.shape}")
                 
+                jet_emb = self.jet_embedding(jet)  # jet: torch.Size([B, num_jet]) --> jet_emb: torch.Size([B, 2*proj_dim])  
                 
                 if hasattr(self, 'simple'):
                     x = F.layer_norm(x, [x.size(-1)]) #Group Norm
@@ -249,28 +310,39 @@ class PET(nn.Module):
                     class_output = self.classifier(x)  #Out Dense
                     reg_output = self.regressor(x)    #Out Dense
                 else:
-                    conditional = jet_emb.unsqueeze(1).expand(-1, x.shape[1], -1)
+                    conditional = jet_emb.unsqueeze(1).expand(-1, x.shape[1], -1) # conditional: torch.Size([B, num_part, 2*proj_dim])
+                   
                     scale, shift = torch.chunk(conditional, 2, dim=-1)
-                    x = x * (1.0 + scale) + shift
-                    #------------------------------------------
-                    B = x.shape[0]
-                    class_tokens = self.class_token.expand(B, -1, -1) #Class tiling
-                    x = torch.cat([class_tokens, x], dim=1)  #concat with input
-                    print(f"After adding class token, x shape: {x.shape}")
+                    x = x * (1.0 + scale) + shift # x : torch.Size([B, num_part, proj_dim])
+                    
+                
+                    B = x.shape[0] # B : B
+                    # cls Before:  torch.Size([1, 1, proj_dim])
+                    class_tokens = self.class_token.expand(B, -1, -1)  
+                    # Class tiling | cls After: torch.Size([B, 1, proj_dim])
+
                     
                     # Updated mask to include class token
                     mask = torch.cat([torch.ones(B, 1, device=mask.device, dtype=mask.dtype), mask], dim=1) 
-                    print(f"Updated mask shape: {mask.shape}")
                     
-                    for transformer_block in self.transformer_blocks:
-                        x = transformer_block(x, mask)
+                    # initial input to transformer concatenated_0 : torch.Size([B, num_part+1, proj_dim])
+                    # class token : torch.Size([B, 1, proj_dim]) , x : torch.Size([B, num_part, proj_dim])
+                    for transformer_block in self.clf_transformer_blocks:
+                        concatenated = torch.cat([class_tokens, x], dim=1) #concat at particle level
+                        out_x , class_tokens = transformer_block(concatenated, class_tokens, mask)
+                   # output after transformer class_token : torch.Size([B, 1, proj_dim])
+                
                     
-                    class_output = self.classifier(x[:, 0])
-                    reg_output = self.regressor(x[:, 0])
+                    class_tokens = F.layer_norm(class_tokens, [class_tokens.size(-1)])
+                    class_output = self.classifier(class_tokens[:, 0])
+                    reg_output = self.regressor(class_tokens[:, 0])
                 
                 return class_output, reg_output
 
         return ClassifierHeadModule()
+    
+# CLASSIFIER HEAD END  ---------------------------------------------------------------------------------------------------------------------------------
+
 
     def GeneratorHead(self, projection_dim, num_jet, num_classes, num_feat, num_layers,
                       simple, num_heads, dropout, talking_head, layer_scale, layer_scale_init,
@@ -310,35 +382,35 @@ class PET(nn.Module):
                     self.generator = nn.Linear(projection_dim, num_feat)
 
             def forward(self, x, jet, mask, time, label):
-                print(f"GeneratorHead input shapes: x: {x.shape}, jet: {jet.shape}, mask: {mask.shape}, time: {time.shape}, label: {label.shape if label is not None else None}")
-                print(f"GeneratorHead input dtypes: x: {x.dtype}, jet: {jet.dtype}, mask: {mask.dtype}, time: {time.dtype}, label: {label.dtype if label is not None else None}")
+                #print(f"GeneratorHead input shapes: x: {x.shape}, jet: {jet.shape}, mask: {mask.shape}, time: {time.shape}, label: {label.shape if label is not None else None}")
+                #print(f"GeneratorHead input dtypes: x: {x.dtype}, jet: {jet.dtype}, mask: {mask.dtype}, time: {time.dtype}, label: {label.dtype if label is not None else None}")
                 
                 jet_emb = self.jet_embedding(jet)
-                print(f"jet_emb shape after embedding: {jet_emb.shape}")
+                #print(f"jet_emb shape after embedding: {jet_emb.shape}")
                 time_emb = self.time_embedding(time)
-                print(f"time_emb shape after embedding: {time_emb.shape}")
+                #print(f"time_emb shape after embedding: {time_emb.shape}")
                 
                 # Squeeze out the extra dimension from time_emb
                 time_emb = time_emb.squeeze(1)
-                print(f"time_emb shape after squeezing: {time_emb.shape}")
+                #print(f"time_emb shape after squeezing: {time_emb.shape}")
                 
-                print(f"Attempting to concatenate: time_emb {time_emb.shape} and jet_emb {jet_emb.shape}")
+                #print(f"Attempting to concatenate: time_emb {time_emb.shape} and jet_emb {jet_emb.shape}")
                 cond_token = self.cond_token(torch.cat([time_emb, jet_emb], dim=-1))
-                print(f"cond_token shape: {cond_token.shape}")
+                #print(f"cond_token shape: {cond_token.shape}")
                 
                 
                 if label is not None:
-                    print(f"Before label_embedding, label dtype: {label.dtype}")
-                    print(f"label_embedding weight dtype: {self.label_embedding.weight.dtype}")
+                 #   print(f"Before label_embedding, label dtype: {label.dtype}")
+                  #  print(f"label_embedding weight dtype: {self.label_embedding.weight.dtype}")
                     label_emb = self.label_embedding(label).to(x.dtype)
-                    print(f"After label_embedding, label_emb dtype: {label_emb.dtype}")
+                   # print(f"After label_embedding, label_emb dtype: {label_emb.dtype}")
 
                     label_emb = F.dropout(label_emb, p=self.feature_drop, training=self.training)
-                    print(f"After dropout, label_emb shape: {label_emb.shape}")
+                    #print(f"After dropout, label_emb shape: {label_emb.shape}")
                     
                     # Average the embeddings across the class dimension  label shape = [250, 10, 128] but, cond_token = [250, 128]. NEED TO VERIFY WITH ORG.
                     label_emb = label_emb.mean(dim=1)
-                    print(f"After averaging, label_emb shape: {label_emb.shape}")
+                    #print(f"After averaging, label_emb shape: {label_emb.shape}")
                     
                     cond_token = cond_token + label_emb
                 else:
@@ -362,7 +434,7 @@ class PET(nn.Module):
         return GeneratorHeadModule()
 
     def FourierProjection(self, projection_dim, num_embed=64):
-        print(f"FourierProjection called with projection_dim: {projection_dim}, num_embed: {num_embed}")
+        #print(f"FourierProjection called with projection_dim: {projection_dim}, num_embed: {num_embed}")
         class FourierEmbedding(nn.Module):
             def __init__(self):
                 super().__init__()
