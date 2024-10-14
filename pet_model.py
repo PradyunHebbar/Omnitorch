@@ -71,8 +71,13 @@ class PET(nn.Module):
         self.generator_head = self.GeneratorHead(
             projection_dim, num_jet, num_classes, num_feat, num_gen_layers, simple,
             num_heads, dropout, talking_head, layer_scale, layer_scale_init, drop_probability,
-            feature_drop, self.TransformerBlock, self.FourierProjection
+            feature_drop, self.GeneratorTransformerBlock, self.FourierProjection
         )
+        # self.generator_head = self.GeneratorHead(
+        #     projection_dim, num_jet, num_classes, num_feat, num_gen_layers, simple,
+        #     num_heads, dropout, talking_head, layer_scale, layer_scale_init,
+        #     drop_probability, feature_drop, self.GeneratorTransformerBlock
+        # )
 
     def forward(self, x, mode='all'):
         features = x['input_features'].to(self.device)
@@ -343,10 +348,51 @@ class PET(nn.Module):
     
 # CLASSIFIER HEAD END  ---------------------------------------------------------------------------------------------------------------------------------
 
+# GENERATOR HEAD START  ---------------------------------------------------------------------------------------------------------------------------------
+    
+    def GeneratorTransformerBlock(self, projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init, drop_probability):
+        class GeneratorTransformerBlockModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm1 = nn.LayerNorm(projection_dim)
+                self.norm3 = nn.LayerNorm(projection_dim)
+            
+                self.attn = nn.MultiheadAttention(projection_dim, num_heads, dropout, batch_first=True)
+            
+                self.mlp = nn.Sequential(
+                    nn.Linear(projection_dim, 2 * projection_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(2 * projection_dim, projection_dim),
+                )
+            
+                if layer_scale:
+                    self.layer_scale1 = LayerScale(layer_scale_init, projection_dim)
+                    self.layer_scale2 = LayerScale(layer_scale_init, projection_dim)
 
-    def GeneratorHead(self, projection_dim, num_jet, num_classes, num_feat, num_layers,
-                      simple, num_heads, dropout, talking_head, layer_scale, layer_scale_init,
-                      drop_probability, feature_drop, TransformerBlock, FourierProjection):
+            def forward(self, x, cond_token, mask=None):
+                x1 = self.norm1(x)
+                updates, _ = self.attn(x1, x1, x1, key_padding_mask=~mask.bool() if mask is not None else None)
+            
+                if layer_scale:
+                    updates = self.layer_scale1(updates, mask)
+                x2 = updates+cond_token
+                x3 = self.norm3(x2)
+                x3 = self.mlp(x3)
+            
+                if layer_scale:
+                    x3 = self.layer_scale2(x3, mask)
+                cond_token = x2 + x3
+            
+                return x, cond_token
+
+        return GeneratorTransformerBlockModule()
+    
+    
+    def GeneratorHead(self, projection_dim, num_jet, num_classes, num_feat, num_layers, simple,
+                            num_heads, dropout, talking_head, layer_scale, layer_scale_init,
+                            drop_probability, feature_drop, GeneratorTransformerBlock, FourierProjection):
+
         class GeneratorHeadModule(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -361,11 +407,13 @@ class PET(nn.Module):
                     nn.Linear(2 * projection_dim, projection_dim),
                     nn.GELU()
                 )
-                #self.label_embedding = nn.Linear(num_classes, projection_dim)
-                self.label_embedding = nn.Embedding(num_classes, projection_dim)  #using the Embedding layer to work with integer inputs
+                #self.label_embedding = nn.Embedding(num_classes, projection_dim)
+                self.label_dense = nn.Linear(num_classes, projection_dim, bias=False)
                 self.feature_drop = feature_drop
-                
+                self.stochastic_depth = StochasticDepth(feature_drop)
+            
                 if simple:
+                    self.cond_dense = nn.Linear(projection_dim, 2 * projection_dim)
                     self.generator = nn.Sequential(
                         nn.LayerNorm(projection_dim),
                         nn.Linear(projection_dim, 2 * projection_dim),
@@ -374,9 +422,9 @@ class PET(nn.Module):
                         nn.Linear(2 * projection_dim, num_feat)
                     )
                 else:
-                    self.transformer_blocks = nn.ModuleList([
-                        TransformerBlock(projection_dim, num_heads, dropout, talking_head,
-                                         layer_scale, layer_scale_init, drop_probability)
+                    self.gen_transformer_blocks = nn.ModuleList([
+                        GeneratorTransformerBlock(projection_dim, num_heads, dropout, talking_head,
+                                                  layer_scale, layer_scale_init, drop_probability)
                         for _ in range(num_layers)
                     ])
                     self.generator = nn.Linear(projection_dim, num_feat)
@@ -385,50 +433,40 @@ class PET(nn.Module):
                 #print(f"GeneratorHead input shapes: x: {x.shape}, jet: {jet.shape}, mask: {mask.shape}, time: {time.shape}, label: {label.shape if label is not None else None}")
                 #print(f"GeneratorHead input dtypes: x: {x.dtype}, jet: {jet.dtype}, mask: {mask.dtype}, time: {time.dtype}, label: {label.dtype if label is not None else None}")
                 
-                jet_emb = self.jet_embedding(jet)
-                #print(f"jet_emb shape after embedding: {jet_emb.shape}")
-                time_emb = self.time_embedding(time)
-                #print(f"time_emb shape after embedding: {time_emb.shape}")
+                jet_emb = self.jet_embedding(jet) # jet_emb shape after embedding: torch.Size([B, proj_dim])
+                time_emb = self.time_embedding(time) # time_emb shape after embedding: torch.Size([B, 1, proj_dim])
                 
                 # Squeeze out the extra dimension from time_emb
-                time_emb = time_emb.squeeze(1)
-                #print(f"time_emb shape after squeezing: {time_emb.shape}")
+                time_emb = time_emb.squeeze(1) # time_emb shape after squeezing: torch.Size([B, proj_dim])
                 
-                #print(f"Attempting to concatenate: time_emb {time_emb.shape} and jet_emb {jet_emb.shape}")
-                cond_token = self.cond_token(torch.cat([time_emb, jet_emb], dim=-1))
-                #print(f"cond_token shape: {cond_token.shape}")
+                cond_token = self.cond_token(torch.cat([time_emb, jet_emb], dim=-1)) # After MLP, cond_token shape: torch.Size([B, proj_dim])
                 
                 
                 if label is not None:
-                 #   print(f"Before label_embedding, label dtype: {label.dtype}")
-                  #  print(f"label_embedding weight dtype: {self.label_embedding.weight.dtype}")
-                    label_emb = self.label_embedding(label).to(x.dtype)
-                   # print(f"After label_embedding, label_emb dtype: {label_emb.dtype}")
-
-                    label_emb = F.dropout(label_emb, p=self.feature_drop, training=self.training)
-                    #print(f"After dropout, label_emb shape: {label_emb.shape}")
-                    
-                    # Average the embeddings across the class dimension  label shape = [250, 10, 128] but, cond_token = [250, 128]. NEED TO VERIFY WITH ORG.
-                    label_emb = label_emb.mean(dim=1)
-                    #print(f"After averaging, label_emb shape: {label_emb.shape}")
-                    
+                    #label_emb = self.label_embedding(label)
+                    label_emb = self.label_dense(label.float())  
+                    label_emb = self.stochastic_depth(label_emb)
                     cond_token = cond_token + label_emb
                 else:
                     print("ERROR: In Generation Head, Label is None, skipping label embedding")
-                
+            
                 cond_token = cond_token.unsqueeze(1).expand(-1, x.shape[1], -1) * mask.unsqueeze(-1)
-                
+            
                 if hasattr(self, 'simple'):
+                    cond_token = self.cond_dense(cond_token)
+                    cond_token = F.gelu(cond_token)
+                    scale, shift = torch.chunk(cond_token, 2, dim=-1)
                     x = F.layer_norm(x, [x.size(-1)])
-                    x = x * (1 + cond_token.chunk(2, dim=-1)[0]) + cond_token.chunk(2, dim=-1)[1]
+                    x = x * (1.0 + scale) + shift
                     x = self.generator(x)
                 else:
-                    for transformer_block in self.transformer_blocks:
-                        x = transformer_block(x + cond_token, mask)
-                    
+                    for transformer_block in self.gen_transformer_blocks:
+                        concatenated = cond_token + x
+                        out_x, cond_token = transformer_block(concatenated, cond_token, mask)
+                    x = cond_token + x
                     x = F.layer_norm(x, [x.size(-1)])
                     x = self.generator(x)
-                
+            
                 return x * mask.unsqueeze(-1)
 
         return GeneratorHeadModule()
@@ -450,8 +488,9 @@ class PET(nn.Module):
             nn.GELU(),
             nn.Linear(2 * projection_dim, projection_dim),
             nn.GELU()
-        )
-
+             )
+# GENERATOR HEAD END  ---------------------------------------------------------------------------------------------------------------------------------
+    
 def get_logsnr_alpha_sigma(time):
     def logsnr_schedule_cosine(t, logsnr_min=-20., logsnr_max=20.):
         b = torch.atan(torch.exp(-0.5 * torch.tensor(logsnr_max)))

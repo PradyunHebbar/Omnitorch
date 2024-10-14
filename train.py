@@ -165,7 +165,8 @@ def train(rank, world_size, args):
                 print(f"Loss components: cls={loss_cls.item():.4f}, reg={loss_reg.item():.4f}, gen={loss_gen.item():.4f}")
                 
                 
-            #Testing gradients (All gradients will be zero before the backward calculation)
+            #Testing gradients 
+            #(All gradients will be zero before the backward calculation)
             # for name, param in model.named_parameters():
             #     if param.grad is None:
             #         print(f"Parameter {name} has no gradient")
@@ -175,14 +176,14 @@ def train(rank, world_size, args):
         
             scaler.scale(loss).backward()
             
-            #-------- DEBUG START --------
+            #--------GRADIENTS DEBUG START --------
             #print("-----SECOND ONE------")
-            # for name, param in model.named_parameters():
-            #     if param.grad is None:
-            #         print(f"Parameter {name} has no gradient")
-            #     elif param.grad.abs().sum() == 0:
-            #         print(f"Parameter {name} has zero gradient")
-            #-------- DEBUG END --------
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    print(f"Parameter {name} has no gradient")
+                elif param.grad.abs().sum() == 0:
+                    print(f"Parameter {name} has zero gradient")
+            #--------GRADIENTS DEBUG END ----------
             
             scaler.step(optimizer)
             scaler.update()
