@@ -152,7 +152,15 @@ def train(rank, world_size, args):
                 perturbed_x = alpha.unsqueeze(1) * inputs['input_features'] + eps * sigma.unsqueeze(1)
                 perturbed_x = torch.where(mask_diffusion, perturbed_x, torch.zeros_like(perturbed_x))
                 
-                v_pred = generator_output
+                # Create a new input dictionary with perturbed features
+                perturbed_inputs = inputs.copy()
+                perturbed_inputs['input_features'] = perturbed_x
+                perturbed_inputs['input_time'] = t.to(perturbed_x.dtype)
+                
+                # Apply the full model to the perturbed inputs
+                _, pert_generator_output = model(perturbed_inputs, mode='all')
+                
+                v_pred = pert_generator_output
                 v_pred = v_pred[:, :, :model.module.num_diffusion].reshape(v_pred.shape[0], -1)
                 
                 v = alpha.unsqueeze(1) * eps - sigma.unsqueeze(1) * inputs['input_features']
