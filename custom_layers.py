@@ -1,6 +1,29 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+from torch.optim.lr_scheduler import _LRScheduler
+
+class CosineDecayWithWarmup(_LRScheduler):
+    def __init__(self, optimizer, warmup_steps, decay_steps, warmup_start_lr, warmup_target_lr, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.decay_steps = decay_steps
+        self.warmup_start_lr = warmup_start_lr
+        self.warmup_target_lr = warmup_target_lr
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps: # self.last_epoch is actually last_step
+            # Linear warmup
+            alpha = self.last_epoch / self.warmup_steps
+            return [self.warmup_start_lr + alpha * (self.warmup_target_lr - self.warmup_start_lr) for _ in self.base_lrs]
+        else:
+            # Cosine decay
+            progress = (self.last_epoch - self.warmup_steps) / (self.decay_steps - self.warmup_steps)
+            progress = min(1.0, max(0.0, progress))
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+            return [self.warmup_target_lr * cosine_decay for _ in self.base_lrs]
+
 
 class StochasticDepth(nn.Module):
     def __init__(self, drop_prob: float):
@@ -14,8 +37,8 @@ class StochasticDepth(nn.Module):
         keep_prob = 1 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()  # binarize
-        return x.div(keep_prob) * random_tensor
+        random_tensor = torch.floor(random_tensor)  # binarize
+        return torch.div(x, keep_prob) * random_tensor
 
 class RandomDrop(nn.Module):
     def __init__(self, drop_prob: float, num_skip: int):
@@ -30,9 +53,12 @@ class RandomDrop(nn.Module):
         keep_prob = 1 - self.drop_prob
         shape = (x.shape[0], 1)
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()  # binarize
-        x[:, :, self.num_skip:] = x[:, :, self.num_skip:] * random_tensor.unsqueeze(2)
-        return x
+        random_tensor.floor_()  # binarize [ IN-PLACE OPERATION ]
+        
+        # Create a new tensor instead of modifying in-place
+        output = x.clone()
+        output[:, :, self.num_skip:] = x[:, :, self.num_skip:] * random_tensor.unsqueeze(2)
+        return output
 
 class TalkingHeadAttention(nn.Module):
     def __init__(self, projection_dim: int, num_heads: int, dropout_rate: float):
@@ -82,7 +108,7 @@ class LayerScale(nn.Module):
 
     def forward(self, x, mask=None):
         if mask is not None:
-            return x * self.gamma * mask
+            return x * self.gamma * mask.unsqueeze(-1)
         else:
             return x * self.gamma
 

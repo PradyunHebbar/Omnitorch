@@ -3,10 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from custom_layers import StochasticDepth, RandomDrop, TalkingHeadAttention, LayerScale
 
+def check_nan(tensor, name):
+    if torch.isnan(tensor).any():
+        print(f"NaN detected in {name}")
+        print(f"Shape: {tensor.shape}")
+        #print(f"Values: {tensor}")
+
+# CLASS PET ITSELF NOT USED IN FORWARD PASS
 class PET(nn.Module):
     def __init__(self,
                  num_feat,
                  num_jet,
+                 
                  num_classes=10,
                  num_keep=7,
                  feature_drop=0.1,
@@ -45,25 +53,14 @@ class PET(nn.Module):
         self.mode = mode
         self.num_diffusion = num_diffusion
         self.num_local = num_local
+        self.ema = 0.999
         
-        self.random_drop = RandomDrop(feature_drop if 'all' in self.mode else 0.0, num_keep)
-        self.feature_embedding = nn.Sequential(
-            nn.Linear(num_feat, 2*projection_dim),
-            nn.GELU(approximate='none'),
-            nn.Linear(2*projection_dim, projection_dim),
-            nn.GELU(approximate='none')
-        )
+        self.body = self.PETBody(num_feat, num_keep, feature_drop, projection_dim, local, K, num_local,
+                                 num_layers, num_heads, drop_probability, talking_head, layer_scale,
+                                 layer_scale_init, dropout, device, mode,
+                                 self.LocalEmbedding , self.TransformerBlock, self.FourierProjection
+                                )
         
-        self.time_embedding = self.FourierProjection(projection_dim).to(self.device)
-        self.time_embed_linear = nn.Linear(self.projection_dim, 2*self.projection_dim, bias=False,device=self.device)
-        
-        if local:
-            self.local_embedding = self.LocalEmbedding(K)
-        
-        self.transformer_blocks = nn.ModuleList([
-            self.TransformerBlock(projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init, drop_probability)
-            for _ in range(num_layers)
-        ])
         
         self.classifier_head = self.ClassifierHead(
             projection_dim, num_jet, num_classes, num_class_layers, simple,
@@ -75,68 +72,20 @@ class PET(nn.Module):
             num_heads, dropout, talking_head, layer_scale, layer_scale_init, drop_probability,
             feature_drop, self.GeneratorTransformerBlock, self.FourierProjection
         )
-        # self.generator_head = self.GeneratorHead(
-        #     projection_dim, num_jet, num_classes, num_feat, num_gen_layers, simple,
-        #     num_heads, dropout, talking_head, layer_scale, layer_scale_init,
-        #     drop_probability, feature_drop, self.GeneratorTransformerBlock
-        # )
+        
+        self.ema_body = nn.Module()
+        self.ema_generator_head = nn.Module()
 
     def forward(self, x, mode='all'):
-        input_features = x['input_features'].to(self.device)
-        input_points = x['input_points'].to(self.device)
-        mask = x['input_mask'].to(self.device)
-        jet = x['input_jet'].to(self.device)
         
-        # the time is only important for the diffusion model, where we perturb the data using a time-dependent function. During training, we sample time from an uniform distribution and determine the perturbation parameters to be applied to the data: https://github.com/ViniciusMikuni/OmniLearn/blob/main/scripts/PET.py#L153
-        time = x.get('input_time', torch.zeros(input_features.shape[0], 1, device=self.device))
-        
-        label = x.get('input_label', None)
-        #print(f"In PET forward, label: {label}")
-    
-        encoded = self.random_drop(input_features)
-        encoded = self.feature_embedding(encoded)
-    
-        time_emb = self.time_embedding(time)
-        #print(f"time_emb shape after time_embedding: {time_emb.shape}")
-    
-        # Correct reshaping of time_emb
-        time_emb = time_emb.squeeze(1).unsqueeze(1).repeat(1, encoded.shape[1], 1)
-        #print(f"time_emb shape after reshape and repeat: {time_emb.shape}")
-    
-        time_emb = time_emb * mask.unsqueeze(-1)
-        #print(f"time_emb shape after applying mask: {time_emb.shape}")
-    
-        time_emb = self.time_embed_linear(time_emb)
-        scale, shift = torch.chunk(time_emb, 2, dim=-1)
-        encoded = encoded * (1.0 + scale) + shift
-        
-        if hasattr(self, 'local_embedding'):
-            coord_shift = 999.0 * (mask == 0).float().unsqueeze(-1)
-            points = input_points[:, :, :2] + coord_shift  # Shape: (batch_size, num_points, 2)
-            local_features = input_features  # Initial features
-            for _ in range(self.num_local):
-                local_features = self.local_embedding(points, local_features)
-                points = local_features  # Update points with the new features
-            encoded = local_features+encoded  # Combine with original features
-        
-        skip_connection = encoded
-        for transformer_block in self.transformer_blocks:
-            encoded = transformer_block(encoded, mask)
-        
-        encoded = encoded + skip_connection  #END OF PET BODY
+        body_output = self.body(x)
         
         if mode in ['classifier', 'all']:
-            #print(f"Before classifier_head, shapes: features: {features.shape}, jet: {jet.shape}, mask: {mask.shape}")
-            classifier_output = self.classifier_head(encoded, jet, mask)
+            classifier_output = self.classifier_head(body_output, x['input_jet'], x['input_mask'])
         
         if mode in ['generator', 'all']:
-            #print(f"Before generator_head, shapes: features: {features.shape}, jet: {jet.shape}, mask: {mask.shape}, time: {time.shape}, label: {label.shape if label is not None else None}")
-            #print(f"Before generator_head, label dtype: {label.dtype if label is not None else None}")
-            generator_output = self.generator_head(encoded, jet, mask, time, label)
-            
-        #print(f"Classifier output shapes: {classifier_output[0].shape}, {classifier_output[1].shape}")
-        #print(f"Generator output shape: {generator_output.shape}")
-        
+            generator_output = self.generator_head(body_output, x['input_jet'], x['input_mask'],
+                                                   x['input_time'], x['input_label'])
         if mode == 'classifier':
             return classifier_output
         elif mode == 'generator':
@@ -144,6 +93,79 @@ class PET(nn.Module):
         else:
             return classifier_output, generator_output
         
+# PET BODY START  ----------------------------------------------------------------------------------        
+    class PETBody(nn.Module):
+        def __init__(self, num_feat, num_keep, feature_drop, projection_dim, local, K, num_local,
+                     num_layers, num_heads, drop_probability, talking_head, layer_scale,
+                     layer_scale_init, dropout, device, mode, LocalEmbedding, TransformerBlock,FourierProjection):
+            super().__init__()
+            self.device = device
+            self.num_keep = num_keep
+            self.feature_drop = feature_drop
+            self.projection_dim = projection_dim
+            self.num_layers = num_layers
+            self.num_heads = num_heads
+            self.num_local = num_local
+            self.drop_probability = drop_probability
+            self.layer_scale = layer_scale
+            self.layer_scale_init = layer_scale_init
+            self.dropout = dropout
+            self.mode = mode
+
+            self.random_drop = RandomDrop(feature_drop if 'all' in self.mode else 0.0, num_keep)
+            self.feature_embedding = nn.Sequential(
+                nn.Linear(num_feat, 2*projection_dim),
+                nn.GELU(approximate='none'),
+                nn.Linear(2*projection_dim, projection_dim),
+                nn.GELU(approximate='none')
+            )
+            
+            self.time_embedding = FourierProjection(projection_dim).to(self.device)
+            self.time_embed_linear = nn.Linear(projection_dim, 2*projection_dim, bias=False, device=self.device)
+            
+            if local:
+                self.local_embedding = LocalEmbedding(K)
+            
+            self.transformer_blocks = nn.ModuleList([
+                TransformerBlock(projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init, drop_probability)
+                for _ in range(num_layers)
+            ])
+            
+        def forward(self, x):
+            input_features = x['input_features'].to(self.device)
+            input_points = x['input_points'].to(self.device)
+            mask = x['input_mask'].to(self.device)
+            
+            # the time is only important for the diffusion model, where we perturb the data using a time-dependent function. During training, we sample time from an uniform distribution and determine the perturbation parameters to be applied to the data: https://github.com/ViniciusMikuni/OmniLearn/blob/main/scripts/PET.py#L153
+            time = x.get('input_time', torch.zeros(input_features.shape[0], 1, device=self.device))
+
+            encoded = self.random_drop(input_features)
+            encoded = self.feature_embedding(encoded)
+
+            time_emb = self.time_embedding(time)
+            # Correct reshaping of time_emb
+            time_emb = time_emb.squeeze(1).unsqueeze(1).repeat(1, encoded.shape[1], 1)
+            time_emb = time_emb * mask.unsqueeze(-1)
+            time_emb = self.time_embed_linear(time_emb)
+            scale, shift = torch.chunk(time_emb, 2, dim=-1)
+            
+            encoded = torch.add(torch.mul(encoded, (1.0 + scale)), shift)
+
+            if hasattr(self, 'local_embedding'):
+                coord_shift = 999.0 * (mask == 0).float().unsqueeze(-1) 
+                points = input_points[:, :, :2] + coord_shift # Shape: (batch_size, num_points, 2)
+                local_features = input_features # Initial features
+                for _ in range(self.num_local):  
+                    local_features = self.local_embedding(points, local_features)
+                    points = local_features # Update points with the new features
+                encoded = local_features + encoded # Combine with original features
+
+            skip_connection = encoded
+            for transformer_block in self.transformer_blocks:
+                encoded = transformer_block(encoded, mask)
+            
+            return torch.add(encoded, skip_connection)
+# PET BODY END  ----------------------------------------------------------------------------------        
 # LOCAL EMBEDDING START  ---------------------------------------------------------------------------------------------------------------------------------      
     
     def LocalEmbedding(self, K):
@@ -185,6 +207,7 @@ class PET(nn.Module):
                 # local_features: torch.Size([N, P, K, 26])
                 # local_features.shape[-1] Shape : 2*C
                 
+                # try to put it in __init__, by specifying "if" in the for loop 
                 mlp = nn.Sequential(
                     nn.Linear(local_features.shape[-1], 2 * self.projection_dim),
                     nn.GELU(approximate='none'),
@@ -227,18 +250,24 @@ class PET(nn.Module):
                     self.layer_scale2 = LayerScale(layer_scale_init, projection_dim)
 
             def forward(self, x, mask=None):
-               # print(f"TransformerBlock input shapes: x: {x.shape}, mask: {mask.shape if mask is not None else None}")
+                #print(f"TransformerBlock input shapes: x: {x.shape}, mask: {mask.shape if mask is not None else None}")
+                # TransformerBlock input shapes: x: torch.Size([B, P, 128]), mask: torch.Size([B, P])
+                
                 if talking_head:
-                    attn_output, _ = self.attn(self.norm1(x), int_matrix=None, mask=mask)
+                    updates, _ = self.attn(self.norm1(x), int_matrix=None, mask=mask)
                 else:
-                    attn_output, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), key_padding_mask=~mask.bool() if mask is not None else None)
+                    updates, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), key_padding_mask=~mask.bool() if mask is not None else None)
                 
                 if layer_scale:
-                    x = x + self.drop_path(self.layer_scale1(attn_output, mask))
-                    x = x + self.drop_path(self.layer_scale2(self.mlp(self.norm2(x)), mask))
+                    #print(f"TransformerBlock: updates: {updates.shape}, mask: {mask.shape if mask is not None else None}")
+                    # Input updates: torch.Size([B, P, 128]), mask: torch.Size([B, P])
+                    x2 = x + self.drop_path(self.layer_scale1(updates, mask))
+                    x3 = self.norm2(x2)
+                    x = x2 + self.drop_path(self.layer_scale2(self.mlp(x3), mask))
                 else:
-                    x = x + self.drop_path(attn_output)
-                    x = x + self.drop_path(self.mlp(self.norm2(x)))
+                    x2 = x + self.drop_path(updates)
+                    x3 = self.norm2(x2)
+                    x = x2 + self.drop_path(self.mlp(x3))
                     
                 if mask is not None:
                     x = x * mask.unsqueeze(-1)
@@ -278,18 +307,22 @@ class PET(nn.Module):
                 x1 = self.norm1(x)
                 query = x1[:, 0].unsqueeze(1)  # Only use the class token as query
     
-                updates, _ = self.attn(query, x1, x1, key_padding_mask=~mask.bool() if mask is not None else None) 
+                updates, _ = self.attn(query, x1, x1, key_padding_mask=~mask.bool() if mask is not None else None)
                 updates = self.norm2(updates)
+
             
                 if layer_scale:
                     updates = self.layer_scale1(updates, mask[:,:1]) # Apply layer scale only to class token
+                    
                 x2 = updates + class_token
                 
                 x3 = self.norm3(x2)
                 x3 = self.mlp(x3)
+
                 
                 if layer_scale:
                     x3 = self.layer_scale2(x3, mask[:,:1]) # Apply layer scale only to class token
+
                 else:
                     x3 = x3
                 cls_token = x3 + x2
@@ -298,7 +331,7 @@ class PET(nn.Module):
 
         return ClassifierTransformerBlockModule()
 
-    def ClassifierHead(self, projection_dim, num_jet, num_classes, num_layers, simple,
+    def ClassifierHead(self, projection_dim, num_jet, num_classes, num_class_layers, simple,
                        num_heads, dropout, talking_head, layer_scale, layer_scale_init,
                        drop_probability, ClassifierTransformerBlock):
         class ClassifierHeadModule(nn.Module):
@@ -329,7 +362,7 @@ class PET(nn.Module):
                     self.clf_transformer_blocks = nn.ModuleList([
                         ClassifierTransformerBlock(projection_dim, num_heads, dropout, talking_head,
                                          layer_scale, layer_scale_init, drop_probability)
-                        for _ in range(num_layers)
+                        for _ in range(num_class_layers)
                     ])
                     self.classifier = nn.Linear(projection_dim, num_classes)
                     self.regressor = nn.Linear(projection_dim, num_jet)
@@ -369,7 +402,7 @@ class PET(nn.Module):
                    # output after transformer class_token : torch.Size([B, 1, proj_dim])
                 
                     
-                    class_tokens = F.layer_norm(class_tokens, [class_tokens.size(-1)])
+                    class_tokens = F.layer_norm(class_tokens, [class_tokens.size(-1)])                    
                     class_output = self.classifier(class_tokens[:, 0])
                     reg_output = self.regressor(class_tokens[:, 0])
                 
@@ -393,7 +426,6 @@ class PET(nn.Module):
                 self.mlp = nn.Sequential(
                     nn.Linear(projection_dim, 2 * projection_dim),
                     nn.GELU(approximate='none'),
-                    nn.Dropout(dropout),
                     nn.Linear(2 * projection_dim, projection_dim),
                 )
             
@@ -501,25 +533,64 @@ class PET(nn.Module):
                 return x * mask.unsqueeze(-1)
 
         return GeneratorHeadModule()
+    
+#     def FourierProjection(self, projection_dim, num_embed=64):
+#         class FourierEmbedding(nn.Module):
+#             def __init__(self):
+#                 super().__init__()
+#                 half_dim = num_embed // 2
+#                 emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+#                 freq = torch.exp(-emb * torch.arange(0, half_dim, dtype=torch.float32))
+                
+#                 # (1) Buffers are tensors that are not trainable parameters (i.e., they do not require gradients),
+#                 # but are part of the module's state_dict (can be saved and loaded)
+#                 # (2) When you call model.to(device), buffers are moved to the specified device (e.g., GPU or CPU) along with the parameters.
+#                 self.register_buffer('freq', freq * 1000.0)
 
+#             def forward(self, x):
+#                 x_proj = x.unsqueeze(1) * self.freq.unsqueeze(0)
+#                 embedding = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+#                 return embedding * x.unsqueeze(1)  # Multiply by x as in TensorFlow
+
+#         return nn.Sequential(
+#             FourierEmbedding(),
+#                 nn.Linear(num_embed, 2 * projection_dim, bias=False),
+#                 nn.SiLU(),
+#                 nn.Linear(2 * projection_dim, projection_dim, bias=False),
+#                 nn.SiLU()
+#                     )
     def FourierProjection(self, projection_dim, num_embed=64):
-        #print(f"FourierProjection called with projection_dim: {projection_dim}, num_embed: {num_embed}")
         class FourierEmbedding(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.W = nn.Parameter(torch.randn(num_embed // 2) * 1000.0)
+                self.projection_dim = projection_dim
+                self.num_embed = num_embed
+                self.half_dim = num_embed // 2
+        
+                # Calculate frequencies
+                emb = torch.log(torch.tensor(10000.0)) / (self.half_dim - 1)
+                self.freq = torch.exp(-emb * torch.arange(self.half_dim, dtype=torch.float32))
+        
+                self.dense1 = nn.Linear(num_embed, 2 * projection_dim, bias=False)
+                self.dense2 = nn.Linear(2 * projection_dim, projection_dim, bias=False)
 
             def forward(self, x):
-                x_proj = x[:, None] * self.W[None, :]
-                return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+                # To Ensure x is 2D: (batch_size, 1)
+                if x.dim() == 1:
+                    x = x.unsqueeze(1)
+        
+                angle = x * self.freq.to(x.device) * 1000.0
+                embedding = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1) * x
+        
+                embedding = self.dense1(embedding)
+                embedding = F.silu(embedding)  # SiLU is equivalent to Swish
+                embedding = self.dense2(embedding)
+                embedding = F.silu(embedding)
+        
+                return embedding
+        return FourierEmbedding()
+        
 
-        return nn.Sequential(
-            FourierEmbedding(),
-            nn.Linear(num_embed, 2 * projection_dim),
-            nn.GELU(),
-            nn.Linear(2 * projection_dim, projection_dim),
-            nn.GELU()
-             )
 # GENERATOR HEAD END  ---------------------------------------------------------------------------------------------------------------------------------
     
 def get_logsnr_alpha_sigma(time):

@@ -2,17 +2,16 @@ import os
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import random
 
 class JetClassDataset(Dataset):
-    def __init__(self, path, rank=0, world_size=1):
+    def __init__(self, path):
         self.path = path
-        self.rank = rank
-        self.world_size = world_size
         
         self.files = [os.path.join(self.path, f) for f in os.listdir(path) if f.endswith('.h5')]
-        self.files = self.files[rank::world_size]  # Distribute files among processes
+        self.files.sort()
+        #self.files = self.files[rank::world_size]  # Distribute files among processes handled by DS
         
         self.mean_part = [0.0, 0.0, -0.0278, 1.8999407, -0.027, 2.244736, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self.std_part = [0.215, 0.215, 0.070, 1.2212526, 0.069, 1.2334691, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
@@ -54,6 +53,10 @@ class JetClassDataset(Dataset):
         return (x - self.mean_jet) / self.std_jet
 # use num_workers to load data with multiple processes. Rule of thumb = num_workers = 4 * num_GPUs
 # Each process (GPU) will create its own DataLoader with num_workers workers.
-def get_dataloader(path, batch_size, rank, world_size, shuffle=True, num_workers=4):
-    dataset = JetClassDataset(path, rank, world_size)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+# def get_dataloader(path, batch_size, rank, world_size, shuffle=True, num_workers=4):
+#     dataset = JetClassDataset(path, rank, world_size)
+#     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+def get_dataloader(path, batch_size, shuffle=True, num_workers=4):
+    dataset = JetClassDataset(path)
+    sampler = DistributedSampler(dataset, shuffle=shuffle)
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=False, num_workers=num_workers, pin_memory=True)
