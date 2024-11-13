@@ -31,6 +31,9 @@ class TopDataset(Dataset):
         self.std_jet = np.array([106.71761, 0.88998157, 40.196922, 15.096386])
 
         self.num_pad = 6
+        self.num_jet = 4
+        self.num_feat = 13
+        self.num_classes = 2
 
         # Load data indices
         with h5.File(self.path, 'r') as f:
@@ -102,19 +105,24 @@ class TopDataset(Dataset):
 
 
 
-def get_top_dataloader(path, batch_size, num_workers=16, distributed=False, shuffle=False):
+def get_top_dataloader(path, batch_size, num_workers=16, distributed=False, shuffle=False, dist=None):
     dataset = TopDataset(path)
     
     if distributed:
-        sampler = DistributedSampler(dataset, shuffle=shuffle)
+        if dist is not None:
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+        shuffle_loader = False
     else:
         sampler = None
-        shuffle = shuffle
-
+        shuffle_loader = shuffle
+        
+        
     return DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
-        shuffle=False,
+        shuffle=shuffle_loader,
         num_workers=num_workers,
         pin_memory=True)

@@ -1,30 +1,37 @@
 import os
 import argparse
+from datetime import datetime
 from itertools import chain
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
+
 #from torch.optim.lr_scheduler import CosineAnnealingLR
 from lion_pytorch import Lion
 #from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import StepLR
+from library.network.utils import CosineDecayWithWarmup
 
-from pet_model import PET, get_logsnr_alpha_sigma
-#from jetclass_dataset import get_dataloader
+from library.network import PET
+from library.network.utils import get_logsnr_alpha_sigma, CosineDecayWithWarmup
+
+from library.dataset import TopDataset, JetClassDataset
+
 from get_logging import log_training_progress, log_roc_data
-from toptag_dataset import get_top_dataloader
-from custom_layers import CosineDecayWithWarmup
 from sklearn.metrics import roc_curve, auc
-from datetime import datetime
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train the PET model on JetClass dataset.")
     parser.add_argument("--folder", type=str, default="../../Datasets/JetClass/sample/", help="Folder containing input files")
     parser.add_argument("--batch", type=int, default=250, help="Batch size")
     parser.add_argument("--epoch", type=int, default=200, help="Max epoch")
+    parser.add_argument("--dataset", type=str, default="top", choices=["jetclass", "top"], 
+                        help="Dataset type to use")
     # ---------------------------------------------------------------------------------------------------
     parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate")
     parser.add_argument("--wd", type=float, default=1e-5, help="Weight decay")
@@ -53,18 +60,28 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--checkpoint", type=str, default="checkpoint.pth", help="Checkpoint file to save/load")
     parser.add_argument("--log_dir", type=str, default="./logs", help="Directory to save logs and checkpoints")
-    return parser.parse_args()
+    return parser.parse_args() 
 
-# def setup(rank, world_size):
-#     os.environ['MASTER_ADDR'] = 'localhost'
-#     os.environ['MASTER_PORT'] = '12355'
-#     dist.init_process_group("nccl", rank=rank, world_size=world_size) #nccl = nvidia back end 
+# def setup(seed=42):
+#     torch.manual_seed(seed)
+#     torch.cuda.manual_seed_all(seed)
+#     dist.init_process_group(backend='nccl', init_method='env://')
+#     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 def setup(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    dist.init_process_group(backend='nccl', init_method='env://')
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    
+    # Get environment variables
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    
+    # Set the device
+    torch.cuda.set_device(local_rank)
+    
+    # Initialize the process group
+    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=world_size)
 
 def cleanup():
     dist.destroy_process_group()
@@ -113,6 +130,40 @@ def configure_optimizers(params, args, train_loader, lr_factor=1.0):
 
     return optimizer, scheduler
 
+def get_dataloader(dataset, batch_size, num_workers=16, distributed=False, shuffle=False, dist=None):
+    """
+    Common dataloader function that works for both distributed and non-distributed scenarios.
+    
+    Args:
+        dataset: Dataset object (TopDataset or JetClassDataset)
+        batch_size: Size of each batch
+        num_workers: Number of worker processes for data loading
+        distributed: Whether to use distributed training
+        shuffle: Whether to shuffle the data
+    """
+    if distributed:
+        if dist is not None:
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        sampler = DistributedSampler(
+            dataset, 
+            num_replicas=world_size, 
+            rank=rank, 
+            shuffle=shuffle
+        )
+        shuffle_loader = False  # When using DistributedSampler, shuffle is handled by the sampler
+    else:
+        sampler = None
+        shuffle_loader = shuffle  # When not using DistributedSampler, use shuffle parameter directly
+        
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=shuffle_loader,
+        num_workers=num_workers,
+        pin_memory=True
+    )
 
 def train(args):
     setup()
@@ -126,54 +177,40 @@ def train(args):
     # Create timestamped log directory
     log_dir = create_log_directory(args)
     
-    # train_loader = get_dataloader(os.path.join(args.folder, 'JetClass', 'train'),
-    #                               args.batch, rank, world_size)
-    # val_loader = get_dataloader(os.path.join(args.folder, 'JetClass', 'val'),
-    #                             args.batch, rank, world_size)
-    # JETCLASS DEBUG LOADERS
-    # train_loader = get_dataloader(os.path.join(args.folder,  'train'),
-    #                               args.batch, shuffle=True)
-    # val_loader = get_dataloader(os.path.join(args.folder,  'val'),
-    #                             args.batch, shuffle=False)
-    
-    #TOP LOADER
-    
+    # Dataset
+    if args.dataset == "jetclass":
+        train_dataset = JetClassDataset(os.path.join(args.folder, 'train'))
+        val_dataset = JetClassDataset(os.path.join(args.folder, 'val'))
+    elif args.dataset == "top":  # top dataset
+        train_dataset = TopDataset(os.path.join(args.folder, 'corrected_train_ttbar.h5'))
+        val_dataset = TopDataset(os.path.join(args.folder, 'corrected_val_ttbar.h5'))
+    else:
+        raise ValueError('Invalid dataset selected :(')
+        
 
-    #train_loader = get_top_dataloader('/u/phebbar/Work/Datasets/Greg_Top_tag_data/omnilearn/TOP/train_ttbar.h5', batch_size=args.batch, shuffle=True, distributed=True)
-    #val_loader = get_top_dataloader('/u/phebbar/Work/Datasets/Greg_Top_tag_data/omnilearn/TOP/val_ttbar.h5', batch_size=args.batch, shuffle=False, distributed=True)
-    train_loader = get_top_dataloader('./TOP/corrected_train_ttbar.h5', batch_size=args.batch, shuffle=True, distributed=True)
-    val_loader = get_top_dataloader('./TOP/corrected_val_ttbar.h5', batch_size=args.batch, shuffle=False, distributed=True)
+    # Create dataloaders using the modified function
+    train_loader = get_dataloader(
+        train_dataset,
+        batch_size=args.batch,
+        distributed=True,  # Since this is in the train function which uses DDP
+        shuffle=True,
+        num_workers=16,
+        dist=dist
+    )
     
-    # END
+    val_loader = get_dataloader(
+        val_dataset,
+        batch_size=args.batch,
+        distributed=True,  # Since this is in the train function which uses DDP
+        shuffle=False,
+        num_workers=16,
+        dist=dist
+    )
     
-    # For JETCLASS
-    # model = PET(num_feat=13,
-    #             num_jet=4,
-    #             num_classes=10,
-    #             num_keep=7,
-    #             feature_drop=args.feature_drop,
-    #             projection_dim=args.projection_dim,
-    #             local=args.local,
-    #             K=10,
-    #             num_local=2,
-    #             num_layers=args.num_layers,
-    #             num_class_layers=2,
-    #             num_gen_layers=2,
-    #             num_heads=args.num_heads,
-    #             drop_probability=args.drop_probability,
-    #             simple=args.simple,
-    #             layer_scale=args.layer_scale,
-    #             layer_scale_init=args.layer_scale_init,
-    #             talking_head=args.talking_head,
-    #             mode=args.mode,
-    #             num_diffusion=3,
-    #             dropout=args.dropout,
-    #            device=device).to(device)
-    
-    # FOR TOP TAG
-    model = PET(num_feat=6+7,
-                num_jet=4,
-                num_classes=2,
+    # Model initialization
+    model = PET(num_feat=train_dataset.num_feat,
+                num_jet=train_dataset.num_jet,
+                num_classes=train_dataset.num_classes,
                 num_keep=7,
                 feature_drop=args.feature_drop,
                 projection_dim=args.projection_dim,
@@ -243,7 +280,7 @@ def train(args):
         model.module.generator_head.parameters()
     )
 
-    # Optimizer for ClassifierHead
+    # Optimizer for Heads
     optimizer_head, scheduler_head = configure_optimizers(classifier_and_generator_params, args, train_loader)
     #scaler = GradScaler()  #use with autocast
     
@@ -285,7 +322,11 @@ def train(args):
         total_samples = 0
         train_pred = []
         train_true = []
-        train_loader.sampler.set_epoch(epoch)
+        
+        # Attempting to call set_epoch without a sampler will cause an error
+        if isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+            train_loader.sampler.set_epoch(epoch)
+
         
         for batch in train_loader:
             inputs, labels = batch
